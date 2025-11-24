@@ -1,0 +1,35 @@
+{
+  "features": [
+    "hemoglobin",
+    "hematocrit",
+    "mcv",
+    "mch",
+    "mchc",
+    "rdw",
+    "serum_iron",
+    "ferritin",
+    "tibc",
+    "transferrin_saturation",
+    "reticulocyte_count",
+    "wbc",
+    "platelet_count",
+    "esr",
+    "bmi",
+    "systolic_bp",
+    "diastolic_bp"
+  ],
+  "diagnosis_mapping": {
+    "Normal": 0,
+    "Iron Deficiency without Anemia": 1,
+    "Mild Iron Deficiency Anemia": 2,
+    "Moderate Iron Deficiency Anemia": 3,
+    "Severe Iron Deficiency Anemia": 4
+  },
+  "target_names": [
+    "Normal",
+    "Iron Deficiency without Anemia",
+    "Mild Iron Deficiency Anemia",
+    "Moderate Iron Deficiency Anemia",
+    "Severe Iron Deficiency Anemia"
+  ]
+}

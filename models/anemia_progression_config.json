@@ -1,0 +1,32 @@
+{
+  "features": [
+    "hemoglobin",
+    "hematocrit",
+    "mcv",
+    "mch",
+    "mchc",
+    "rdw",
+    "serum_iron",
+    "ferritin",
+    "tibc",
+    "transferrin_saturation",
+    "reticulocyte_count",
+    "bmi",
+    "systolic_bp",
+    "diastolic_bp"
+  ],
+  "max_length": 20,
+  "input_size": 14,
+  "hidden_size": 128,
+  "num_layers": 2,
+  "num_classes": 5,
+  "encoder_classes": [
+    "Improving",
+    "Resolved",
+    "Severe",
+    "Stable",
+    "Worsening"
+  ],
+  "test_accuracy": 0.9907094594594594,
+  "test_f1_score": 0.9906914751947621
+}
