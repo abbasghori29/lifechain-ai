@@ -11,8 +11,14 @@ from sqlalchemy import select, text, func, and_, or_
 from uuid import UUID
 import os
 
-# Add project root to Python path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
+# Ensure project root and model_training directory are on Python path
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_TRAINING_DIR = PROJECT_ROOT / "model_training"
+
+for p in (PROJECT_ROOT, MODEL_TRAINING_DIR):
+    p_str = str(p)
+    if p_str not in sys.path:
+        sys.path.insert(0, p_str)
 
 # Import the LSTM model class before importing InferenceService
 from train_models import ProgressionBiLSTM
@@ -38,6 +44,136 @@ class ProgressionReportService:
         self.inference = InferenceService()
         self.inference.load_models()
     
+    def _calculate_severity_score(self, progression_stage: str, disease_name: str = None) -> float:
+        """
+        Calculate a numerical severity score (0-10) from progression stage for Y-axis charting.
+        Higher score = more severe condition.
+        """
+        if not progression_stage:
+            return 0.0
+        
+        stage_lower = progression_stage.lower().strip()
+        
+        # CKD stages (eGFR-based)
+        ckd_scores = {
+            'normal': 0.0,
+            'stage 1': 1.0,
+            'stage_1': 1.0,
+            'stage 2': 2.5,
+            'stage_2': 2.5,
+            'stage 3a': 4.0,
+            'stage_3a': 4.0,
+            'stage 3b': 5.5,
+            'stage_3b': 5.5,
+            'stage 3': 5.0,
+            'stage_3': 5.0,
+            'stage 4': 7.5,
+            'stage_4': 7.5,
+            'stage 5': 9.0,
+            'stage_5': 9.0,
+            'esrd': 10.0,
+            'end stage renal disease': 10.0,
+            'dialysis': 10.0,
+        }
+        
+        # Diabetes progression scores
+        diabetes_scores = {
+            'normal': 0.0,
+            'prediabetes': 3.0,
+            'pre-diabetes': 3.0,
+            'controlled': 4.0,
+            'diabetes': 5.0,
+            'uncontrolled': 7.0,
+            'complicated': 8.5,
+            'severe': 9.0,
+            'critical': 10.0,
+        }
+        
+        # Anemia progression scores
+        anemia_scores = {
+            'normal': 0.0,
+            'mild': 2.5,
+            'moderate': 5.0,
+            'severe': 7.5,
+            'critical': 10.0,
+            'iron deficiency without anemia': 2.0,
+            'mild iron deficiency anemia': 3.5,
+            'moderate iron deficiency anemia': 5.5,
+            'severe iron deficiency anemia': 8.0,
+        }
+        
+        # Generic progression scores
+        generic_scores = {
+            'normal': 0.0,
+            'stable': 1.0,
+            'mild': 2.5,
+            'moderate': 5.0,
+            'slowly progressing': 4.0,
+            'progressing': 6.0,
+            'rapidly progressing': 8.0,
+            'severe': 7.5,
+            'critical': 9.0,
+            'end stage': 10.0,
+            'cured': 0.0,
+        }
+        
+        # Check CKD-specific scores first
+        if stage_lower in ckd_scores:
+            return ckd_scores[stage_lower]
+        
+        # Check diabetes-specific scores
+        if stage_lower in diabetes_scores:
+            return diabetes_scores[stage_lower]
+        
+        # Check anemia-specific scores
+        if stage_lower in anemia_scores:
+            return anemia_scores[stage_lower]
+        
+        # Fall back to generic scores
+        if stage_lower in generic_scores:
+            return generic_scores[stage_lower]
+        
+        # If no match, try partial matching
+        for key, score in generic_scores.items():
+            if key in stage_lower or stage_lower in key:
+                return score
+        
+        # Default to middle value if unknown
+        return 5.0
+    
+    def _normalize_disease_query(self, disease_name: str) -> str:
+        """
+        Normalize disease name query to handle common abbreviations and variations.
+        Returns a pattern that will match the disease in the database.
+        
+        Examples:
+        - "ckd" -> "%chronic%kidney%" or "%ckd%" (matches "chronic_kidney_disease")
+        - "diabetes" -> "%diabetes%" (matches "diabetes", "Type 2 Diabetes", etc.)
+        - "anemia" -> "%anemia%" or "%iron%deficiency%" (matches "iron_deficiency_anemia")
+        """
+        disease_lower = disease_name.lower().strip()
+        
+        # Map common abbreviations to search patterns
+        disease_patterns = {
+            'ckd': '%chronic%kidney%',
+            'chronic kidney disease': '%chronic%kidney%',
+            'chronic_kidney_disease': '%chronic%kidney%',
+            'diabetes': '%diabetes%',
+            'diabetic': '%diabetes%',
+            'anemia': '%anemia%',
+            'ida': '%iron%deficiency%',
+            'iron deficiency anemia': '%iron%deficiency%',
+            'iron_deficiency_anemia': '%iron%deficiency%',
+        }
+        
+        # Check if we have a specific pattern for this disease
+        if disease_lower in disease_patterns:
+            return disease_patterns[disease_lower]
+        
+        # Otherwise, use the disease name as a pattern (with wildcards for flexibility)
+        # This handles cases where the query might be a partial match
+        return f"%{disease_name}%"
+    
     async def generate_progression_report(
         self, 
         patient_id: UUID, 
@@ -61,7 +197,9 @@ class ProgressionReportService:
             risk_factors = await self.get_risk_factors(patient_id, disease_name, db)
             
             # Get recommendations
-            recommendations = await self.get_recommendations(patient_id, disease_name, db)
+            recommendations_response = await self.get_recommendations(patient_id, db)
+            # Extract just the recommendations list from the full response
+            recommendations = recommendations_response.get('recommendations', []) if isinstance(recommendations_response, dict) else []
             
             # Predict future progression
             future_prediction = await self.predict_future_progression(patient_id, disease_name, 6, db)
@@ -106,6 +244,7 @@ class ProgressionReportService:
                 DiseaseProgression.assessed_date,
                 DiseaseProgression.progression_stage,
                 DiseaseProgression.notes,
+                DiseaseProgression.confidence_score,
                 DoctorVisit.visit_date,
                 DoctorVisit.visit_type,
                 DoctorVisit.doctor_notes
@@ -118,7 +257,7 @@ class ProgressionReportService:
             ).where(
                 and_(
                     DiseaseProgression.patient_id == patient_id,
-                    DiseaseProgression.disease_name.ilike(disease_name),
+                    DiseaseProgression.disease_name.ilike(self._normalize_disease_query(disease_name)),
                     DiseaseProgression.assessed_date >= start_date
                 )
             ).order_by(DiseaseProgression.assessed_date.asc())
@@ -128,14 +267,19 @@ class ProgressionReportService:
             
             timeline = []
             for row in rows:
+                progression_stage = row[1]
+                # Calculate severity score from progression stage for Y-axis charting
+                severity_score = self._calculate_severity_score(progression_stage, disease_name)
+                
                 timeline.append({
                     'date': row[0].isoformat() if row[0] else None,
-                    'progression_stage': row[1],
-                    'severity_score': None,  # column not present in DB
+                    'progression_stage': progression_stage,
+                    'severity_score': severity_score,
+                    'confidence_score': float(row[3]) if row[3] is not None else None,
                     'notes': row[2],
-                    'visit_date': row[3].isoformat() if row[3] else None,
-                    'visit_type': row[4],
-                    'doctor_notes': row[5]
+                    'visit_date': row[4].isoformat() if row[4] else None,
+                    'visit_type': row[5],
+                    'doctor_notes': row[6]
                 })
             
             return timeline
@@ -163,7 +307,7 @@ class ProgressionReportService:
             ).where(
                 and_(
                     FamilyDiseaseHistory.patient_id == patient_id,
-                    FamilyDiseaseHistory.disease_name.ilike(disease_name)
+                    FamilyDiseaseHistory.disease_name.ilike(self._normalize_disease_query(disease_name))
                 )
             ).distinct()
             
@@ -701,7 +845,7 @@ Provide recommendations as a numbered list."""
             ).where(
                 and_(
                     FamilyDiseaseHistory.patient_id.in_(relative_ids),
-                    FamilyDiseaseHistory.disease_name.ilike(disease_name)
+                    FamilyDiseaseHistory.disease_name.ilike(self._normalize_disease_query(disease_name))
                 )
             )
             
