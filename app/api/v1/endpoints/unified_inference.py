@@ -697,9 +697,10 @@ async def health_check():
             multi_disease_inference.load_models()
         
         info = multi_disease_inference.get_model_info()
-        models_loaded = any(
+        models_loaded = (
             info['diabetes'].get('diagnosis_loaded', False) or info['diabetes'].get('progression_loaded', False) or
-            info['anemia'].get('diagnosis_loaded', False) or info['anemia'].get('progression_loaded', False)
+            info['anemia'].get('diagnosis_loaded', False) or info['anemia'].get('progression_loaded', False) or
+            info['ckd'].get('diagnosis_loaded', False) or info['ckd'].get('progression_loaded', False)
         )
         
         if not models_loaded:

@@ -27,6 +27,16 @@ class MultiDiseaseInference:
         }
         self._models_loaded = False
     
+    def reload_models(self):
+        """Force reload all models (clears cache)"""
+        self._models_loaded = False
+        self.models = {
+            'diabetes': {},
+            'anemia': {},
+            'ckd': {}
+        }
+        self.load_models()
+    
     def load_models(self):
         """Load all disease models"""
         print("Loading ML models...")
@@ -56,18 +66,57 @@ class MultiDiseaseInference:
         diagnosis_path = self.models_dir / "diabetes_diagnosis_xgb.pkl"
         if diagnosis_path.exists():
             with open(diagnosis_path, 'rb') as f:
-                self.models['diabetes']['diagnosis'] = pickle.load(f)
-            print("  ✅ Diabetes diagnosis model loaded")
+                loaded_data = pickle.load(f)
+                # Handle both dict format and direct model object
+                if isinstance(loaded_data, dict):
+                    if 'model' in loaded_data:
+                        # Extract the actual model from dict
+                        self.models['diabetes']['diagnosis'] = loaded_data['model']
+                        self.models['diabetes']['diagnosis_features'] = loaded_data.get('feature_columns', [])
+                        print(f"  ✅ Diabetes diagnosis model extracted from dict. Model type: {type(loaded_data['model'])}")
+                    else:
+                        raise ValueError(f"Diabetes model file contains dict but no 'model' key. Keys found: {list(loaded_data.keys())}")
+                else:
+                    # Direct model object
+                    self.models['diabetes']['diagnosis'] = loaded_data
+                    print(f"  ✅ Diabetes diagnosis model loaded directly. Model type: {type(loaded_data)}")
+            
+            # Verify the loaded model has predict method
+            if not hasattr(self.models['diabetes']['diagnosis'], 'predict'):
+                raise ValueError(f"Loaded diabetes model does not have 'predict' method. Type: {type(self.models['diabetes']['diagnosis'])}")
+            
+            print("  ✅ Diabetes diagnosis model loaded and verified")
         
         # Load LSTM progression model
         progression_path = self.models_dir / "diabetes_progression_lstm.pth"
         if progression_path.exists():
             model, checkpoint = load_lstm_model(str(progression_path), device='cpu', model_type='diabetes')
+            
+            # Load full checkpoint to get scaler and encoder
+            import torch
+            full_checkpoint = torch.load(str(progression_path), map_location='cpu', weights_only=False)
+            
+            # Extract scaler and encoder if available
+            scaler = full_checkpoint.get('scaler')
+            encoder = full_checkpoint.get('encoder')
+            features = full_checkpoint.get('feature_columns', [
+                'fasting_glucose', 'hba1c', 'hdl', 'ldl', 'triglycerides',
+                'total_cholesterol', 'creatinine', 'bmi', 'systolic_bp', 'diastolic_bp'
+            ])
+            
             self.models['diabetes']['progression'] = {
                 'model': model,
-                'checkpoint': checkpoint
+                'checkpoint': checkpoint,
+                'scaler': scaler,
+                'encoder': encoder,
+                'features': features,
+                'max_length': 25  # From train_models.py
             }
             print("  ✅ Diabetes progression model loaded")
+            if scaler:
+                print("  ✅ Diabetes progression scaler loaded")
+            if encoder:
+                print("  ✅ Diabetes progression encoder loaded")
     
     def _load_anemia_models(self):
         """Load anemia diagnosis and progression models"""
@@ -177,7 +226,30 @@ class MultiDiseaseInference:
         if not self._models_loaded:
             self.load_models()
         
-        model = self.models['diabetes']['diagnosis']
+        model = self.models['diabetes'].get('diagnosis')
+        
+        # Verify model is loaded and is actually a model object
+        if model is None:
+            raise ValueError("Diabetes diagnosis model not loaded. Please ensure models/diabetes_diagnosis_xgb.pkl exists.")
+        
+        # If model is still a dict, try to extract it (safety check for cached models)
+        if isinstance(model, dict):
+            if 'model' in model:
+                # Fix it on the fly
+                self.models['diabetes']['diagnosis'] = model['model']
+                model = model['model']
+                print("⚠️  WARNING: Diabetes model was a dict, extracted model object. Consider restarting server.")
+            else:
+                # Try to reload models
+                print("⚠️  WARNING: Diabetes model is invalid dict, attempting reload...")
+                self.reload_models()
+                model = self.models['diabetes'].get('diagnosis')
+                if isinstance(model, dict):
+                    raise ValueError(f"Diabetes model is a dict but doesn't contain 'model' key. Keys: {list(model.keys())}")
+        
+        # Verify model has predict method
+        if not hasattr(model, 'predict'):
+            raise ValueError(f"Loaded object is not a valid model. Type: {type(model)}, has predict: {hasattr(model, 'predict')}")
         
         # Expected features for diabetes
         features = [
@@ -253,6 +325,67 @@ class MultiDiseaseInference:
             'confidence': float(max(probabilities)),
             'probabilities': prob_dict,
             'input_features': patient_data
+        }
+    
+    def predict_diabetes_progression(self, patient_sequence: List[Dict[str, float]]) -> Dict[str, Any]:
+        """Predict diabetes progression from patient visit sequence"""
+        if not self._models_loaded:
+            self.load_models()
+        
+        if 'progression' not in self.models['diabetes']:
+            raise ValueError("Diabetes progression model not loaded. Please ensure models/diabetes_progression_lstm.pth exists.")
+        
+        model = self.models['diabetes']['progression']['model']
+        checkpoint = self.models['diabetes']['progression']['checkpoint']
+        scaler = self.models['diabetes']['progression'].get('scaler')
+        encoder = self.models['diabetes']['progression'].get('encoder')
+        features = self.models['diabetes']['progression'].get('features', [
+            'fasting_glucose', 'hba1c', 'hdl', 'ldl', 'triglycerides',
+            'total_cholesterol', 'creatinine', 'bmi', 'systolic_bp', 'diastolic_bp'
+        ])
+        max_length = self.models['diabetes']['progression'].get('max_length', 25)
+        
+        # Prepare sequence
+        sequence = []
+        for visit in patient_sequence:
+            visit_data = [visit.get(f, 0.0) for f in features]
+            sequence.append(visit_data)
+        
+        # Pad sequence
+        X = pad_sequences([sequence], maxlen=max_length, dtype='float32', padding='pre', truncating='pre')
+        
+        # Scale if scaler is available
+        if scaler:
+            X_flat = X.reshape(-1, X.shape[-1])
+            X_scaled = scaler.transform(X_flat).reshape(X.shape)
+        else:
+            X_scaled = X
+        
+        # Convert to tensor
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+        
+        # Predict
+        model.eval()
+        with torch.no_grad():
+            outputs = model(X_tensor)
+            probabilities = torch.softmax(outputs, dim=1).numpy()[0]
+            prediction = torch.argmax(outputs, dim=1).item()
+        
+        # Get class names
+        if encoder:
+            progression_classes = encoder.classes_
+        else:
+            # Default classes if encoder not available
+            progression_classes = ['Normal', 'Controlled', 'Uncontrolled', 'Complicated']
+        
+        prob_dict = {str(cls): float(probabilities[i]) for i, cls in enumerate(progression_classes)}
+        
+        return {
+            'progression': str(progression_classes[prediction]),
+            'confidence': float(max(probabilities)),
+            'probabilities': prob_dict,
+            'num_visits': len(patient_sequence),
+            'model_used': 'diabetes_progression_lstm'
         }
     
     def predict_anemia_progression(self, patient_sequence: List[Dict[str, float]]) -> Dict[str, Any]:
@@ -475,8 +608,7 @@ class MultiDiseaseInference:
         
         # Route to appropriate method
         if disease_key == 'diabetes':
-            # TODO: Implement diabetes progression if needed
-            raise NotImplementedError("Diabetes progression prediction not yet implemented")
+            return self.predict_diabetes_progression(patient_sequence)
         elif disease_key == 'anemia':
             return self.predict_anemia_progression(patient_sequence)
         elif disease_key == 'ckd':
@@ -517,6 +649,11 @@ class MultiDiseaseInference:
         disease_key = disease_map.get(disease_name, disease_name)
         
         if disease_key == 'diabetes' and prediction_type == 'diagnosis':
+            return [
+                'fasting_glucose', 'hba1c', 'hdl', 'ldl', 'triglycerides',
+                'total_cholesterol', 'creatinine', 'bmi', 'systolic_bp', 'diastolic_bp'
+            ]
+        elif disease_key == 'diabetes' and prediction_type == 'progression':
             return [
                 'fasting_glucose', 'hba1c', 'hdl', 'ldl', 'triglycerides',
                 'total_cholesterol', 'creatinine', 'bmi', 'systolic_bp', 'diastolic_bp'
