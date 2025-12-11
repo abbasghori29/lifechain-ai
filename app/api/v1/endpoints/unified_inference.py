@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.db.session import get_db
 from app.services.multi_disease_inference import multi_disease_inference
 from app.models import Patient, LabTestResult, LabReport, DoctorVisit, Diagnosis
+from app.models.disease import DiseaseProgression
 from app.models.visit import VisitTypeEnum, DiagnosisStatusEnum
 from app.api.v1.dependencies import get_translation_language, apply_translation
 from app.services.translation import translate_text
@@ -87,20 +88,81 @@ async def find_or_create_lab_review_visit(
     return new_visit
 
 
+def _map_diagnosis_to_progression_stage(disease_name: str, diagnosis: str) -> str:
+    """
+    Map diagnosis result to progression stage for DiseaseProgression record.
+    
+    Args:
+        disease_name: Name of the disease
+        diagnosis: Diagnosis result (e.g., "Normal", "Diabetes", "Stage 1", etc.)
+    
+    Returns:
+        Progression stage string
+    """
+    disease_lower = disease_name.lower()
+    diagnosis_lower = diagnosis.lower()
+    
+    # Diabetes progression stages
+    if 'diabetes' in disease_lower or 'diabetic' in disease_lower:
+        if 'normal' in diagnosis_lower:
+            return "Normal"
+        elif 'prediabetes' in diagnosis_lower or 'prediabetic' in diagnosis_lower:
+            return "Prediabetes"
+        elif 'diabetes' in diagnosis_lower:
+            return "Diabetes"
+        else:
+            return diagnosis  # Use diagnosis as-is
+    
+    # CKD progression stages
+    elif 'ckd' in disease_lower or 'kidney' in disease_lower:
+        if 'normal' in diagnosis_lower:
+            return "Normal"
+        elif 'stage 1' in diagnosis_lower:
+            return "Stage 1"
+        elif 'stage 2' in diagnosis_lower:
+            return "Stage 2"
+        elif 'stage 3' in diagnosis_lower:
+            return "Stage 3"
+        elif 'stage 4' in diagnosis_lower:
+            return "Stage 4"
+        elif 'stage 5' in diagnosis_lower or 'esrd' in diagnosis_lower:
+            return "ESRD"
+        else:
+            return diagnosis  # Use diagnosis as-is
+    
+    # Anemia progression stages
+    elif 'anemia' in disease_lower or 'ida' in disease_lower:
+        if 'normal' in diagnosis_lower:
+            return "Normal"
+        elif 'mild' in diagnosis_lower:
+            return "Mild"
+        elif 'moderate' in diagnosis_lower:
+            return "Moderate"
+        elif 'severe' in diagnosis_lower:
+            return "Severe"
+        else:
+            return diagnosis  # Use diagnosis as-is
+    
+    # Default: use diagnosis as progression stage
+    return diagnosis
+
+
 async def auto_create_diagnosis(
     visit_id: UUID,
     disease_name: str,
     prediction_result: Dict[str, Any],
-    db: AsyncSession
+    db: AsyncSession,
+    patient_id: UUID = None
 ) -> Diagnosis:
     """
-    Automatically create a diagnosis record from ML prediction.
+    Automatically create a diagnosis record and progression record from ML prediction.
     
     Args:
         visit_id: Visit ID to link diagnosis to
         disease_name: Name of the disease
         prediction_result: Result from ML prediction (should contain diagnosis, confidence, etc.)
         db: Database session
+        patient_id: Patient ID (required for creating progression record)
     
     Returns:
         Diagnosis instance
@@ -119,18 +181,41 @@ async def auto_create_diagnosis(
     elif 'ckd' in disease_lower or 'kidney' in disease_lower:
         model_name = 'xgb_ckd_v1'
     
+    # Get diagnosis result
+    diagnosis_result = prediction_result.get('diagnosis', 'Unknown')
+    confidence = prediction_result.get('confidence', 0.0)
+    assessed_date = datetime.utcnow()
+    
     # Create diagnosis with SUSPECTED status (doctor can confirm later)
     diagnosis = Diagnosis(
         visit_id=visit_id,
         disease_name=disease_name.lower(),
-        diagnosis_date=datetime.utcnow(),
-        confidence_score=prediction_result.get('confidence', 0.0),
+        diagnosis_date=assessed_date,
+        confidence_score=confidence,
         ml_model_used=model_name,
         status=DiagnosisStatusEnum.SUSPECTED,  # Auto-created diagnoses start as SUSPECTED
-        notes=f"Auto-generated diagnosis from ML model ({model_name}). Confidence: {prediction_result.get('confidence', 0.0):.2%}. Doctor review recommended."
+        notes=f"Auto-generated diagnosis from ML model ({model_name}). Confidence: {confidence:.2%}. Doctor review recommended."
     )
     
     db.add(diagnosis)
+    await db.flush()  # Flush to get diagnosis ID if needed
+    
+    # Also create DiseaseProgression record for timeline
+    if patient_id:
+        progression_stage = _map_diagnosis_to_progression_stage(disease_name, diagnosis_result)
+        
+        progression = DiseaseProgression(
+            patient_id=patient_id,
+            disease_name=disease_name.lower(),
+            progression_stage=progression_stage,
+            assessed_date=assessed_date,
+            ml_model_used=model_name,
+            confidence_score=confidence,
+            notes=f"Auto-generated progression from ML diagnosis. Stage: {progression_stage}. Confidence: {confidence:.2%}."
+        )
+        
+        db.add(progression)
+    
     await db.commit()
     await db.refresh(diagnosis)
     
@@ -551,12 +636,13 @@ async def predict_patient_diagnosis(
                 # Find or create a lab_review visit
                 visit = await find_or_create_lab_review_visit(patient_id, db)
                 
-                # Auto-create diagnosis with SUSPECTED status
+                # Auto-create diagnosis with SUSPECTED status (also creates progression record)
                 diagnosis = await auto_create_diagnosis(
                     visit.visit_id,
                     disease_name,
                     prediction_result,
-                    db
+                    db,
+                    patient_id=patient_id
                 )
                 
                 # Add diagnosis info to response
